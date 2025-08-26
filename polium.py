@@ -3,15 +3,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Iterable, List, Optional
+from typing import Any, Iterable, List, Optional, Tuple
 
 import folium
 import polars as pl
 from branca.colormap import LinearColormap
 from folium import GeoJson, Map, Marker, Popup, Tooltip
-from folium.plugins import MarkerCluster, TimestampedGeoJson
+from folium.plugins import MarkerCluster, TimestampedGeoJson, AntPath
 
-# --- Optional deps ---
+# ----- Optional deps -----
 try:
     from shapely.geometry import mapping  # type: ignore
     from shapely.geometry.base import BaseGeometry  # type: ignore
@@ -28,7 +28,14 @@ try:
 except Exception:  # pragma: no cover
     _HAS_H3 = False
 
-# ---- Small helpers ----
+try:
+    import pyproj  # type: ignore
+
+    _HAS_PYPROJ = True
+except Exception:  # pragma: no cover
+    _HAS_PYPROJ = False
+
+# ----- Small helpers -----
 
 
 def _ensure_latlon(df: pl.DataFrame, lat: str, lon: str) -> None:
@@ -51,47 +58,69 @@ def _popup_text(row: dict, keys: list[str]) -> str:
     return "<br/>".join(parts)
 
 
-def _colormap(values: Iterable[float], cmap: Optional[LinearColormap]) -> LinearColormap:
-    vals = list(float(v) for v in values)
+def _colormap(values: Iterable[float] | None, cmap: Optional[LinearColormap]) -> LinearColormap:
+    if cmap is not None:
+        return cmap
+    vals: list[float] = []
+    if values is not None:
+        for v in values:
+            try:
+                vals.append(float(v))
+            except Exception:
+                pass
     if not vals:
-        return cmap or LinearColormap(["#440154", "#21908C", "#FDE725"], vmin=0.0, vmax=1.0)
+        return LinearColormap(["#440154", "#21908C", "#FDE725"], vmin=0.0, vmax=1.0)
     vmin = min(vals)
     vmax = max(vals)
     if abs(vmax - vmin) < 1e-12:
         vmax = vmin + 1e-9
-    return cmap or LinearColormap(["#440154", "#21908C", "#FDE725"], vmin=vmin, vmax=vmax)
+    return LinearColormap(["#440154", "#21908C", "#FDE725"], vmin=vmin, vmax=vmax)
 
 
 def _to_geojson_geom(geom: Any) -> dict:
-    """Accepts: shapely geometry, GeoJSON geometry dict, or list-of-[lon,lat] ring."""
+    """Accept shapely geometry, GeoJSON dict, or list-of-[lon,lat] ring."""
     if isinstance(geom, dict) and "type" in geom and "coordinates" in geom:
-        return geom  # already geojson geometry
+        return geom
     if _HAS_SHAPELY and isinstance(geom, BaseGeometry):  # type: ignore[arg-type]
         return mapping(geom)  # type: ignore[misc]
     if isinstance(geom, (list, tuple)) and geom and isinstance(geom[0], (list, tuple)):
-        # assume polygon ring [[lon,lat],...]
         ring = [[float(x), float(y)] for x, y in geom]
         if ring[0] != ring[-1]:
             ring.append(ring[0])
         return {"type": "Polygon", "coordinates": [ring]}
     raise TypeError(
-        "Unsupported geometry. Provide a shapely geometry, a GeoJSON geometry dict, "
-        "or a list of [lon,lat] polygon ring coordinates."
+        "Unsupported geometry. Provide shapely geometry, GeoJSON geometry dict, "
+        "or a list of [lon,lat] ring coordinates."
     )
 
 
 # H3 compatibility shim (v3/v4), called only if _HAS_H3 is True.
 def _h3_boundary(cell: str) -> list[list[float]]:
     if not _HAS_H3:
-        raise RuntimeError("h3 is not installed. pip install 'h3>=4,<5'  (or h3==3.7.7)")
+        raise RuntimeError("h3 not installed. pip install 'h3>=4,<5'  (or h3==3.7.7)")
     if hasattr(h3, "h3_to_geo_boundary"):
         return h3.h3_to_geo_boundary(cell, geo_json=True)  # v3 → [(lat,lon), ...]
     return h3.cell_to_boundary(cell, geo_json=True)  # v4
 
 
+def _geodesic_circle(lon: float, lat: float, radius_m: float, n: int = 256) -> List[List[float]]:
+    if not _HAS_PYPROJ:
+        raise RuntimeError("pyproj required for geodesic ring. Install with: pip install pyproj")
+    geod = pyproj.Geod(ellps="WGS84")
+    coords: List[List[float]] = []
+    step = 360.0 / n
+    a = 0.0
+    for _ in range(n):
+        lon2, lat2, _ = geod.fwd(lon, lat, a, radius_m)
+        coords.append([lon2, lat2])
+        a += step
+    coords.append(coords[0])
+    return coords
+
+
 @dataclass
 class PoliumMap:
-    """Drop-in: minimal Polars → Folium wrapper using a local tileserver."""
+    """Minimal Polars → Folium wrapper using a local tileserver. AIS-friendly visuals by default."""
 
     tiles_url_template: str
     center: Optional[tuple[float, float]] = None
@@ -113,7 +142,71 @@ class PoliumMap:
             control=True,
         ).add_to(self._map)
 
-    # ---- Layers ----
+    # ---------- AIS-friendly dots (CircleMarker) ----------
+
+    def add_dots(
+        self,
+        df: pl.DataFrame,
+        lat: str = "lat",
+        lon: str = "lon",
+        *,
+        value: Optional[str] = None,  # e.g., "sog_kn" to color by speed
+        cmap: Optional[LinearColormap] = None,
+        radius: int = 4,
+        stroke: bool = True,
+        stroke_color: str = "#ffffff",  # white halo for contrast
+        stroke_weight: int = 1,
+        fill_opacity: float = 0.85,
+        default_fill: str = "#1f77b4",
+        tooltip: Optional[str] = None,
+        popup: Optional[List[str]] = None,
+        name: str = "dots",
+    ) -> "PoliumMap":
+        """
+        Plot each row as a small vector dot (CircleMarker). Fast and clean for AIS.
+        If `value` provided, colors by a LinearColormap and adds a legend.
+        """
+        _ensure_latlon(df, lat, lon)
+        if self._map.location == [0.0, 0.0] and df.height:
+            self._map.location = list(_infer_center(df, lat, lon))
+
+        vals = df[value].to_list() if (value and value in df.columns) else None
+        col = _colormap(vals, cmap)
+
+        group = folium.FeatureGroup(name=name, show=True)
+
+        for row in df.to_dicts():
+            la = float(row[lat])
+            lo = float(row[lon])
+            fill = default_fill
+            if value and value in row and row[value] is not None:
+                try:
+                    fill = col(float(row[value]))
+                except Exception:
+                    pass
+            cm = folium.CircleMarker(
+                location=(la, lo),
+                radius=radius,
+                color=stroke_color if stroke else None,
+                weight=stroke_weight if stroke else 0,
+                fill=True,
+                fill_color=fill,
+                fill_opacity=fill_opacity,
+                opacity=1.0 if stroke else 0.0,
+            )
+            if tooltip and tooltip in row:
+                cm.add_child(Tooltip(str(row[tooltip])))
+            if popup:
+                cm.add_child(Popup(_popup_text(row, popup), max_width=300))
+            cm.add_to(group)
+
+        group.add_to(self._map)
+        if value:
+            col.caption = f"{name}: {value}"
+            col.add_to(self._map)
+        return self
+
+    # ---------- Optional: classic pin markers (kept for completeness) ----------
 
     def add_points(
         self,
@@ -125,6 +218,7 @@ class PoliumMap:
         cluster: bool = True,
         name: str = "points",
     ) -> "PoliumMap":
+        """Classic pin markers; prefer `add_dots` for AIS."""
         _ensure_latlon(df, lat, lon)
         if self._map.location == [0.0, 0.0] and df.height:
             self._map.location = list(_infer_center(df, lat, lon))
@@ -147,6 +241,8 @@ class PoliumMap:
         group.add_to(self._map)
         return self
 
+    # ---------- Time points (always-on plugin; not toggleable in LayerControl) ----------
+
     def add_time_points(
         self,
         df: pl.DataFrame,
@@ -156,7 +252,7 @@ class PoliumMap:
         popup: Optional[List[str]] = None,
         tooltip: Optional[str] = None,
         period: str = "P1D",
-        name: str = "time-points",  # kept for API symmetry; not used by Folium
+        name: str = "time-points",  # kept for API symmetry
     ) -> "PoliumMap":
         _ensure_latlon(df, lat, lon)
         feats: list[dict[str, Any]] = []
@@ -187,6 +283,7 @@ class PoliumMap:
         ).add_to(self._map)
         return self
 
+    # ---------- Choropleth + H3 (unchanged APIs) ----------
 
     def add_choropleth(
         self,
@@ -278,7 +375,78 @@ class PoliumMap:
             col.add_to(self._map)
         return self
 
-    # ---- Output / control ----
+    # ---------- Track + Range ring (AIS utilities) ----------
+
+    def add_track(
+        self,
+        df: pl.DataFrame,
+        lat: str = "lat",
+        lon: str = "lon",
+        *,
+        name: str = "track",
+        weight: int = 3,
+        color: str = "#2c7fb8",
+        opacity: float = 0.9,
+        dashed: bool = False,
+        ant_path: bool = False,
+        show_endpoints: bool = True,
+        endpoint_color: str = "#000000",
+    ) -> "PoliumMap":
+        """Draw a polyline through the points (in row order)."""
+        _ensure_latlon(df, lat, lon)
+        coords = [(float(r[lat]), float(r[lon])) for r in df.to_dicts()]
+        if not coords:
+            return self
+        if ant_path:
+            AntPath(locations=coords, weight=weight, opacity=opacity, color=color).add_to(self._map)
+        else:
+            folium.PolyLine(
+                coords,
+                weight=weight,
+                color=color,
+                opacity=opacity,
+                dash_array="6,6" if dashed else None,
+                name=name,
+            ).add_to(self._map)
+        if show_endpoints:
+            # start (green), end (red)
+            folium.CircleMarker(coords[0], radius=5, color="#2ca25f", fill=True, fill_opacity=1).add_to(self._map)
+            folium.CircleMarker(coords[-1], radius=5, color="#de2d26", fill=True, fill_opacity=1).add_to(self._map)
+        return self
+
+    def add_range_ring(
+        self,
+        center: Tuple[float, float],  # (lat, lon)
+        radius_m: float,
+        *,
+        name: str = "range",
+        line_color: str = "#e34a33",
+        line_weight: int = 2,
+        fill_color: str = "#e34a33",
+        fill_opacity: float = 0.10,
+        n: int = 256,
+        tooltip: Optional[str] = None,
+    ) -> "PoliumMap":
+        """Geodesic ring polygon; requires pyproj."""
+        lat, lon = float(center[0]), float(center[1])
+        ring = _geodesic_circle(lon=lon, lat=lat, radius_m=radius_m, n=n)
+        gj = GeoJson(
+            {"type": "Feature", "geometry": {"type": "Polygon", "coordinates": [ring]}},
+            name=name,
+            style_function=lambda _feat: {
+                "color": line_color,
+                "weight": line_weight,
+                "fillColor": fill_color,
+                "fillOpacity": fill_opacity,
+            },
+        )
+        if tooltip:
+            gj.add_child(folium.Tooltip(tooltip))
+        gj.add_to(self._map)
+        folium.CircleMarker((lat, lon), radius=4, color=line_color, fill=True, fill_opacity=1).add_to(self._map)
+        return self
+
+    # ---------- Output / control ----------
 
     def add_layer_control(self, collapsed: bool = False) -> "PoliumMap":
         folium.LayerControl(position="topright", collapsed=collapsed).add_to(self._map)
