@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
+import re
 from typing import Any, Iterable, List, Optional, Tuple
 
 import folium
@@ -36,6 +38,92 @@ except Exception:  # pragma: no cover
     _HAS_PYPROJ = False
 
 # ----- Small helpers -----
+
+# --- Offline asset rewriting (remove all CDN calls) ---
+
+# Known CDN patterns used by folium & plugins (Leaflet, TimeDimension, AntPath)
+_CDN_PATTERNS: dict[str, re.Pattern[str]] = {
+    # Leaflet core
+    "leaflet_js": re.compile(r"https://cdn\.jsdelivr\.net/npm/leaflet@[^/]+/dist/leaflet(?:\.min)?\.js"),
+    "leaflet_css": re.compile(r"https://cdn\.jsdelivr\.net/npm/leaflet@[^/]+/dist/leaflet(?:\.min)?\.css"),
+    # jQuery
+    "jquery_js": re.compile(r"https://code\.jquery\.com/jquery-\d+\.\d+\.\d+\.min\.js"),
+    # Bootstrap (v5 bundle + v5 css)
+    "bootstrap_js": re.compile(r"https://cdn\.jsdelivr\.net/npm/bootstrap@[^/]+/dist/js/bootstrap\.bundle\.min\.js"),
+    "bootstrap_css": re.compile(r"https://cdn\.jsdelivr\.net/npm/bootstrap@[^/]+/dist/css/bootstrap\.min\.css"),
+    # Bootstrap 3 glyphicons css (used by AwesomeMarkers template)
+    "bootstrap_glyphicons_css": re.compile(r"https?://netdna\.bootstrapcdn\.com/bootstrap/\d+\.\d+\.\d+/css/bootstrap-glyphicons\.css"),
+    # Font Awesome
+    "fa_css": re.compile(r"https://cdn\.jsdelivr\.net/npm/@fortawesome/fontawesome-free@[^/]+/css/all\.min\.css"),
+    # Leaflet.AwesomeMarkers
+    "awesomemarkers_js": re.compile(r"https://cdnjs\.cloudflare\.com/ajax/libs/Leaflet\.awesome-markers/\d+\.\d+\.\d+/leaflet\.awesome-markers\.js"),
+    "awesomemarkers_css": re.compile(r"https://cdnjs\.cloudflare\.com/ajax/libs/Leaflet\.awesome-markers/\d+\.\d+\.\d+/leaflet\.awesome-markers\.css"),
+    "awesomemarkers_rotate_css": re.compile(r"https://cdn\.jsdelivr\.net/gh/python-visualization/folium/folium/templates/leaflet\.awesome\.rotate\.min\.css"),
+    # TimeDimension (if you use add_time_points)
+    "timedimension_js": re.compile(r"https://cdn\.jsdelivr\.net/npm/leaflet-timedimension@[^/]+/dist/leaflet\.timedimension(?:\.min)?\.js"),
+    "timedimension_css": re.compile(r"https://cdn\.jsdelivr\.net/npm/leaflet-timedimension@[^/]+/dist/leaflet\.timedimension\.control(?:\.min)?\.css"),
+    "moment_js": re.compile(r"https://(?:cdnjs\.cloudflare\.com/ajax/libs/moment\.js/\d+\.\d+\.\d+/moment\.min\.js|cdn\.jsdelivr\.net/npm/moment@[^/]+/min/moment\.min\.js)"),
+    "iso8601_js": re.compile(r"https://cdn\.jsdelivr\.net/npm/iso8601-js-period@[^/]+/iso8601(?:\.min)?\.js"),
+    # AntPath (if you use ant_path=True)
+    "antpath_js": re.compile(r"https://cdn\.jsdelivr\.net/npm/leaflet-ant-path@[^/]+/dist/leaflet-ant-path(?:\.min)?\.js"),
+    # Fallback OSM tiles that sometimes appear
+    "osm_tiles": re.compile(r"https://tile\.openstreetmap\.org/\{z\}/\{x\}/\{y\}\.png"),
+}
+
+def _rewrite_external_assets(
+    html: str,
+    assets_dir: str | None,
+    extra_map: dict[str, str] | None,
+    tiles_fallback: str | None,
+) -> str:
+    """
+    Replace external CDN URLs in the generated HTML with local file paths.
+
+    Parameters
+    ----------
+    assets_dir : base folder containing local JS/CSS files (we assume standard filenames)
+    extra_map  : explicit overrides {key: local_path}; keys are those in _CDN_PATTERNS
+    tiles_fallback : if an OSM tile URL is found, replace with this tiles template
+    """
+    replacements: dict[str, str] = {}
+
+    if assets_dir:
+        base = Path(assets_dir)
+        defaults = {
+            "leaflet_js": base / "leaflet.js",
+            "leaflet_css": base / "leaflet.css",
+            "jquery_js": base / "jquery-3.7.1.min.js",
+            "bootstrap_js": base / "bootstrap.bundle.min.js",
+            "bootstrap_css": base / "bootstrap.min.css",
+            "bootstrap_glyphicons_css": base / "bootstrap-glyphicons.css",
+            "fa_css": base / "all.min.css",
+            "awesomemarkers_js": base / "leaflet.awesome-markers.js",
+            "awesomemarkers_css": base / "leaflet.awesome-markers.css",
+            "awesomemarkers_rotate_css": base / "leaflet.awesome.rotate.min.css",
+            # Only needed if you use add_time_points(...)
+            "timedimension_js": base / "leaflet.timedimension.min.js",
+            "timedimension_css": base / "leaflet.timedimension.control.css",
+            "moment_js": base / "moment.min.js",
+            "iso8601_js": base / "iso8601.min.js",
+            # ant path (only if used)
+            "antpath_js": base / "leaflet-ant-path.min.js",
+        }
+        replacements.update({k: str(v) for k, v in defaults.items()})
+
+    if extra_map:
+        replacements.update(extra_map)
+
+    # tiles fallback mapping (OSM -> your local template)
+    if tiles_fallback:
+        replacements["osm_tiles"] = tiles_fallback
+
+    # Do the substitutions
+    for key, pat in _CDN_PATTERNS.items():
+        local = replacements.get(key)
+        if local:
+            html = pat.sub(local, html)
+
+    return html
 
 
 def _ensure_latlon(df: pl.DataFrame, lat: str, lon: str) -> None:
@@ -455,9 +543,37 @@ class PoliumMap:
     def to_html(self) -> str:
         return self._map.get_root().render()
 
-    def save(self, path: str) -> str:
-        self._map.save(path)
+    def save(
+        self,
+        path: str,
+        *,
+        offline_assets_dir: str | None = None,
+        assets_map: dict[str, str] | None = None,
+        strict_offline: bool = False,
+    ) -> str:
+        html = self.to_html()
+        if offline_assets_dir or assets_map:
+            html = _rewrite_external_assets(
+                html,
+                offline_assets_dir,
+                assets_map,
+                tiles_fallback=self.tiles_url_template,  # replace any stray OSM tile URLs
+            )
+
+        if strict_offline:
+            external_calls = [
+                u for u in re.findall(r"""["'](https?://[^"']+)["']""", html)
+                if not u.startswith("http://127.0.0.1") and not u.startswith("http://localhost")
+            ]
+            if external_calls:
+                raise RuntimeError(
+                    "External URLs still present:\n  - " + "\n  - ".join(external_calls)
+                    + "\nProvide local assets via offline_assets_dir or assets_map."
+                )
+
+        Path(path).write_text(html, encoding="utf-8")
         return path
+
 
     @property
     def folium_map(self) -> Map:

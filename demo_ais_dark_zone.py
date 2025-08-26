@@ -36,5 +36,6 @@ m.add_dots(df,
         #    value="sog_kn", 
            tooltip="time", popup=["time","sog_kn"], name="AIS dots")
 
-m.save("ais_pretty.html")
+m.save("ais_pretty.html", offline_assets_dir="assets", strict_offline=False)
+
 print("Saved ais_pretty.html")
