@@ -3,3 +3,10 @@ __pycache__/
 assets/
 
 .DS_Store
+
+# Python packaging
+*.egg-info/
+dist/
+build/
+*.pyc
+*.pyo
