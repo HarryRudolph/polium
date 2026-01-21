@@ -126,6 +126,125 @@ def _rewrite_external_assets(
     return html
 
 
+def _embed_inline_assets(
+    html: str,
+    assets_dir: str | None,
+    extra_map: dict[str, str] | None,
+    tiles_fallback: str | None,
+) -> str:
+    """
+    Embed all external assets directly into the HTML file for complete offline usage.
+
+    This replaces external CDN URLs with inline <script> and <style> blocks,
+    making the HTML completely standalone.
+
+    Parameters
+    ----------
+    assets_dir : base folder containing local JS/CSS files (we assume standard filenames)
+    extra_map  : explicit overrides {key: local_path}; keys are those in _CDN_PATTERNS
+    tiles_fallback : if an OSM tile URL is found, replace with this tiles template
+    """
+    replacements: dict[str, Path] = {}
+
+    if assets_dir:
+        base = Path(assets_dir)
+        defaults = {
+            "leaflet_js": base / "leaflet.js",
+            "leaflet_css": base / "leaflet.css",
+            "jquery_js": base / "jquery-3.7.1.min.js",
+            "bootstrap_js": base / "bootstrap.bundle.min.js",
+            "bootstrap_css": base / "bootstrap.min.css",
+            "bootstrap_glyphicons_css": base / "bootstrap-glyphicons.css",
+            "fa_css": base / "all.min.css",
+            "awesomemarkers_js": base / "leaflet.awesome-markers.js",
+            "awesomemarkers_css": base / "leaflet.awesome-markers.css",
+            "awesomemarkers_rotate_css": base / "leaflet.awesome.rotate.min.css",
+            # Only needed if you use add_time_points(...)
+            "timedimension_js": base / "leaflet.timedimension.min.js",
+            "timedimension_css": base / "leaflet.timedimension.control.css",
+            "moment_js": base / "moment.min.js",
+            "iso8601_js": base / "iso8601.min.js",
+            # ant path (only if used)
+            "antpath_js": base / "leaflet-ant-path.min.js",
+        }
+        replacements.update(defaults)
+
+    if extra_map:
+        replacements.update({k: Path(v) for k, v in extra_map.items()})
+
+    # tiles fallback mapping (OSM -> your local template)
+    if tiles_fallback:
+        html = _CDN_PATTERNS["osm_tiles"].sub(tiles_fallback, html)
+
+    # Embed each asset inline
+    for key, pat in _CDN_PATTERNS.items():
+        if key == "osm_tiles":
+            continue  # Already handled above
+
+        asset_path = replacements.get(key)
+        if asset_path and asset_path.exists():
+            try:
+                content = asset_path.read_text(encoding="utf-8")
+
+                # Determine if this is JS or CSS based on the key suffix
+                if key.endswith("_js"):
+                    # Wrap in inline script tag
+                    inline_content = f"<script>\n{content}\n</script>"
+                    # Match any script tag containing this URL pattern
+                    # We search for the URL first, then replace the whole tag
+                    matches = list(pat.finditer(html))
+                    for match in reversed(matches):  # Reverse to maintain string positions
+                        url = match.group(0)
+                        # Find the script tag containing this URL
+                        # Look backwards and forwards from the URL position to find the tag boundaries
+                        start_pos = match.start()
+                        end_pos = match.end()
+
+                        # Find the opening <script tag before this URL
+                        script_start = html.rfind('<script', 0, start_pos)
+                        if script_start == -1:
+                            continue
+
+                        # Find the closing </script> after this URL
+                        script_end = html.find('</script>', end_pos)
+                        if script_end == -1:
+                            continue
+                        script_end += len('</script>')
+
+                        # Replace the entire script tag with inline content
+                        html = html[:script_start] + inline_content + html[script_end:]
+
+                elif key.endswith("_css"):
+                    # Wrap in inline style tag
+                    inline_content = f"<style>\n{content}\n</style>"
+                    # Match any link tag containing this URL pattern
+                    matches = list(pat.finditer(html))
+                    for match in reversed(matches):  # Reverse to maintain string positions
+                        url = match.group(0)
+                        start_pos = match.start()
+                        end_pos = match.end()
+
+                        # Find the opening <link tag before this URL
+                        link_start = html.rfind('<link', 0, start_pos)
+                        if link_start == -1:
+                            continue
+
+                        # Find the end of the link tag (either /> or >)
+                        link_end = html.find('>', end_pos)
+                        if link_end == -1:
+                            continue
+                        link_end += 1
+
+                        # Replace the entire link tag with inline content
+                        html = html[:link_start] + inline_content + html[link_end:]
+
+            except Exception as e:
+                # If we can't read a file, skip it (it might not be needed for this map)
+                pass
+
+    return html
+
+
 def _ensure_latlon(df: pl.DataFrame, lat: str, lon: str) -> None:
     if lat not in df.columns or lon not in df.columns:
         raise KeyError(f"DataFrame must contain '{lat}' and '{lon}' columns.")
@@ -549,16 +668,39 @@ class PoliumMap:
         *,
         offline_assets_dir: str | None = None,
         assets_map: dict[str, str] | None = None,
+        embed_assets: bool = True,
         strict_offline: bool = False,
     ) -> str:
+        """
+        Save the map to an HTML file.
+
+        Parameters
+        ----------
+        path : Output HTML file path
+        offline_assets_dir : Base folder containing local JS/CSS files
+        assets_map : Explicit overrides {key: local_path} for specific assets
+        embed_assets : If True (default), embed all assets inline for complete offline usage.
+                       If False, use file path references instead.
+        strict_offline : If True, raise an error if any external URLs remain in the HTML
+        """
         html = self.to_html()
         if offline_assets_dir or assets_map:
-            html = _rewrite_external_assets(
-                html,
-                offline_assets_dir,
-                assets_map,
-                tiles_fallback=self.tiles_url_template,  # replace any stray OSM tile URLs
-            )
+            if embed_assets:
+                # Embed all assets inline for complete standalone HTML
+                html = _embed_inline_assets(
+                    html,
+                    offline_assets_dir,
+                    assets_map,
+                    tiles_fallback=self.tiles_url_template,  # replace any stray OSM tile URLs
+                )
+            else:
+                # Just replace CDN URLs with local file paths
+                html = _rewrite_external_assets(
+                    html,
+                    offline_assets_dir,
+                    assets_map,
+                    tiles_fallback=self.tiles_url_template,  # replace any stray OSM tile URLs
+                )
 
         if strict_offline:
             external_calls = [
