@@ -82,7 +82,6 @@ The `embed_assets=True` option (default) embeds all JS/CSS directly into the HTM
 
 - **Simple API**: Clean, chainable methods for adding map elements
 - **Offline Support**: Fully offline maps with embedded or local assets
-- **AIS-Friendly**: Optimized for vessel tracking and marine visualization
 - **Time Animations**: Built-in support for time-series data
 - **H3 Hexes**: Native H3 hexagon support for spatial aggregation
 - **Geodesic Rings**: Accurate range rings using geodesic calculations
@@ -117,7 +116,6 @@ See the `examples/` directory for more:
 - `add_time_points` uses the Leaflet TimeDimension plugin and **does not appear in LayerControl** (plugin limitation)
 - H3 on Python 3.13+: prefer `pip install "h3>=4,<5"`
 - For offline maps without time/ant-path features, those specific assets aren't needed
-- The library prioritizes simplicity and AIS/maritime use cases while remaining general-purpose
 
 ## Requirements
 
